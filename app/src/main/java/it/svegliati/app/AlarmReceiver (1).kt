@@ -1,0 +1,49 @@
+package it.svegliati.app
+import android.app.*
+import android.content.*
+import android.media.*
+import android.net.Uri
+import android.os.*
+import android.view.*
+import android.widget.*
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+
+class AlarmReceiver:BroadcastReceiver(){override fun onReceive(c:Context,i:Intent){val id=i.getIntExtra("id",-1);val a=Store.all(c).find{it.id==id&&it.enabled}?:return;Store.prefs(c).edit().remove("confirm_$id").remove("standby_$id").apply();if(i.action=="regular"&&a.days!=0)Schedule.next(c,a);c.startForegroundService(Intent(c,RingService::class.java).putExtra("id",id))}}
+class RingService:Service(){
+ private var player:MediaPlayer?=null;private var id=-1
+ override fun onBind(i:Intent?)=null
+ override fun onStartCommand(i:Intent?,flags:Int,startId:Int):Int{if(i?.action=="silence"){player?.release();player=null;return START_NOT_STICKY};id=i?.getIntExtra("id",-1)?:-1;val a=Store.all(this).find{it.id==id}?:run{stopSelf();return START_NOT_STICKY};val nm=getSystemService(NotificationManager::class.java);nm.createNotificationChannel(NotificationChannel("ring_v3","Sveglia in corso",NotificationManager.IMPORTANCE_HIGH).apply{setSound(null,null);lockscreenVisibility=Notification.VISIBILITY_PUBLIC});val pi=PendingIntent.getActivity(this,id,Intent(this,AlarmActivity::class.java).putExtra("id",id).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE);val n=Notification.Builder(this,"ring_v3").setSmallIcon(android.R.drawable.ic_lock_idle_alarm).setContentTitle(a.name.ifBlank{"SVEGLIA $id"}).setContentText("Tocca per aprire SVEGLIATI").setCategory(Notification.CATEGORY_ALARM).setOngoing(true).setPriority(Notification.PRIORITY_MAX).setContentIntent(pi).setFullScreenIntent(pi,true).build();startForeground(10000+id,n);player?.release();player=null;fun play(uri:Uri){player=MediaPlayer().apply{setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build());setDataSource(this@RingService,uri);isLooping=true;prepare();start()}};try{play(if(a.voice.isNotBlank())Uri.fromFile(java.io.File(a.voice)) else if(a.sound.isNotBlank())Uri.parse(a.sound) else RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM))}catch(e:Exception){player?.release();try{play(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM))}catch(e:Exception){}};return START_NOT_STICKY}
+ override fun onDestroy(){player?.release();player=null;stopForeground(STOP_FOREGROUND_REMOVE);super.onDestroy()}
+}
+class AlarmActivity:Activity(){var id=-1;var red=false;val handler=Handler(Looper.getMainLooper());var pressed=false;var held=false;lateinit var a:Alarm
+ override fun onCreate(b:Bundle?){super.onCreate(b);setShowWhenLocked(true);setTurnScreenOn(true);window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);id=intent.getIntExtra("id",-1);a=Store.all(this).find{it.id==id}?:run{finish();return};red=Store.prefs(this).getBoolean("confirm_$id",false);show();if(red)armStandby()}
+ fun show(){val root=LinearLayout(this).apply{orientation=1;gravity=Gravity.CENTER;setPadding(24,24,24,24);setBackgroundColor(Color.BLACK);fitsSystemWindows=true};val clock=TextClock(this).apply{format12Hour="HH:mm";format24Hour="HH:mm";textSize=48f;setTextColor(Color.WHITE);gravity=Gravity.CENTER};root.addView(clock);val alarmNameView=TextView(this).apply{text=a.name.ifBlank{"SVEGLIA $id"};textSize=20f;setTextColor(Color.WHITE);gravity=Gravity.CENTER};root.addView(alarmNameView);val button=Button(this).apply{text=if(red)a.red.ifBlank{"TI SEI ALZATO ?"} else a.green.ifBlank{a.name.ifBlank{"SVEGLIATI !"}};textSize=30f;setTextColor(Color.WHITE);typeface=Typeface.DEFAULT_BOLD;background=GradientDrawable().apply{cornerRadius=24f;setColor(if(red)0xffc62430.toInt() else 0xff169b43.toInt())}};root.addView(button,LinearLayout.LayoutParams(-1,0,1f).apply{setMargins(0,40,0,40)});val hint=TextView(this).apply{text=if(red)"Tieni premuto 2 secondi per confermare" else "Tocca per rinviare • Tieni premuto 2 secondi per fermare";setTextColor(Color.WHITE);gravity=Gravity.CENTER};root.addView(hint);setContentView(root);val hold=Runnable{if(pressed){held=true;if(red)complete() else confirm()}};button.setOnTouchListener{v,e->when(e.actionMasked){MotionEvent.ACTION_DOWN->{pressed=true;held=false;handler.postDelayed(hold,2000);true};MotionEvent.ACTION_UP->{pressed=false;handler.removeCallbacks(hold);if(!held&&!red){v.performClick();retry()};true};MotionEvent.ACTION_CANCEL->{pressed=false;handler.removeCallbacks(hold);true};else->true}}}
+ fun retry(){Store.prefs(this).edit().putBoolean("confirm_$id",false).apply();Schedule.at(this,id,System.currentTimeMillis()+Store.snooze(this),true);stopService(Intent(this,RingService::class.java));finish()}
+ private val standby = Runnable {
+     if(red && !isFinishing){
+         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+         setTurnScreenOn(false)
+         setShowWhenLocked(false)
+         finish()
+     }
+ }
+ private fun armStandby(){
+     handler.removeCallbacks(standby)
+     val remaining = Store.prefs(this).getLong("standby_$id",System.currentTimeMillis()) - System.currentTimeMillis()
+     handler.postDelayed(standby,remaining.coerceAtLeast(0L))
+ }
+ fun confirm(){
+     red=true
+     val now=System.currentTimeMillis()
+     Store.prefs(this).edit().putBoolean("confirm_$id",true).putLong("standby_$id",now+60_000L).apply()
+     Schedule.at(this,id,now+Store.snooze(this),true)
+     stopService(Intent(this,RingService::class.java))
+     getSystemService(NotificationManager::class.java).cancel(10000+id)
+     show()
+     armStandby()
+ }
+ fun complete(){Schedule.cancel(this,id,true);Store.prefs(this).edit().remove("confirm_$id").remove("standby_$id").apply();if(a.days==0)Store.put(this,a.copy(enabled=false));stopService(Intent(this,RingService::class.java));getSystemService(NotificationManager::class.java).cancel(10000+id);finish()}
+ override fun onDestroy(){handler.removeCallbacksAndMessages(null);super.onDestroy()}
+}
